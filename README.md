@@ -1,11 +1,18 @@
 # Тестовое задание "MultiReader"
 
-## Базовая версия
+## Общее
 
-- Условие для кандидата - [тут](solution/level_1/condition/main.go)
-- Эталонное решение - [тут](solution/level_1/solution/main.go)
-- Описание решения - [тут](solution/level_1/solution/solution.md)
+- Запуск тестов - `make t`
+- Проверка сборки приложения `make build`
 
-## Продвинутая версия
+
+## Task 1 (базовая версия)
+
+- Условие для кандидата - [тут](task1/task.md)
+- Шаблон для кандидата - [тут](task1/task.go)
+- Эталонное решение - [тут](task1/task_expected.go)
+
+
+## Task 2 (продвинутая версия)
 
 - Скоро

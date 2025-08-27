@@ -1,6 +1,6 @@
-module example.com/multi-reader/level1/solution
+module github.com/zlatoivan/multi-reader
 
-go 1.21
+go 1.23.5
 
 require github.com/stretchr/testify v1.11.0
 

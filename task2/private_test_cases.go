@@ -6,6 +6,32 @@ import (
 	"strings"
 )
 
+// flakySRC — источник, который один раз возвращает (0,nil), затем ведёт себя как обычный strings.Reader.
+type flakySRC struct {
+	*strings.Reader
+	size     int64
+	zeroOnce bool
+}
+
+func newFlakySRC(s string) *flakySRC {
+	r := strings.NewReader(s)
+	return &flakySRC{Reader: r, size: int64(r.Len())}
+}
+
+func (f *flakySRC) Read(p []byte) (int, error) {
+	if !f.zeroOnce {
+		f.zeroOnce = true
+		return 0, nil
+	}
+	return f.Reader.Read(p)
+}
+
+func (f *flakySRC) Seek(offset int64, whence int) (int64, error) {
+	return f.Reader.Seek(offset, whence)
+}
+func (f *flakySRC) Close() error { return nil }
+func (f *flakySRC) Size() int64  { return f.size }
+
 var privateTestCases = []TestCase{
 	{
 		name: "Seek от конца",
@@ -239,6 +265,151 @@ var privateTestCases = []TestCase{
 				return false
 			}
 			return seekCalls > before
+		},
+	},
+	{
+		name: "Маленькие ридеры, большие чанки",
+		run: func() bool {
+			a := newMockStringsReader("aaaaa")
+			b := newMockStringsReader("bbb")
+			c := newMockStringsReader("cccccccc")
+			m := NewMultiReader(2, a, b, c)
+			buf := make([]byte, int(m.Size()))
+			n, err := m.Read(buf)
+			if err != nil || n != len(buf) {
+				return false
+			}
+			return string(buf) == "aaaaabbbcccccccc"
+		},
+	},
+	{
+		name: "Seek назад внутри окна и сразу Read — буфер не сбрасывается",
+		run: func() bool {
+			var seeks int
+			r := newMockStringsReader("abcdef")
+			r.seekCalls = &seeks
+			m := NewMultiReader(2, r)
+			buf := make([]byte, 4)
+			_, _ = m.Read(buf) // abcd
+			before := seeks
+			if _, err := m.Seek(-1, io.SeekCurrent); err != nil { // позиция на 'd'
+				return false
+			}
+			b2 := make([]byte, 1)
+			n, err := m.Read(b2)
+			if err != nil || n != 1 || string(b2) != "d" {
+				return false
+			}
+			return seeks == before
+		},
+	},
+	{
+		name: "Дальний Seek вперёд за окно и немедленный Read — новый префетч",
+		run: func() bool {
+			var seeks int
+			r := newMockStringsReader(strings.Repeat("x", 64))
+			r.seekCalls = &seeks
+			m := NewMultiReader(2, r)
+			buf := make([]byte, 8)
+			_, _ = m.Read(buf) // прогреем окно
+			before := seeks
+			if _, err := m.Seek(50, io.SeekStart); err != nil {
+				return false
+			}
+			b2 := make([]byte, 1)
+			n, err := m.Read(b2)
+			if err != nil || n != 1 || string(b2) != "x" {
+				return false
+			}
+			return seeks > before
+		},
+	},
+	{
+		name: "EOF-контракт при n>0 и err==EOF из источника",
+		run: func() bool {
+			r := newMockStringsReader("z")
+			m := NewMultiReader(1, r)
+			b := make([]byte, 10)
+			n, err := m.Read(b)
+			if err != nil || n != 1 || string(b[:n]) != "z" {
+				return false
+			}
+			n, err = m.Read(b)
+			return n == 0 && errors.Is(err, io.EOF)
+		},
+	},
+	{
+		name: "Close во время фонового чтения не падает",
+		run: func() bool {
+			r := newMockStringsReader(strings.Repeat("a", 1<<16))
+			m := NewMultiReader(2, r)
+			done := make(chan struct{})
+			go func() {
+				buf := make([]byte, 1<<15)
+				_, _ = m.Read(buf)
+				close(done)
+			}()
+			_ = m.Close()
+			<-done
+			return true
+		},
+	},
+	{
+		name: "Источник n==0, err==nil — не зависаем",
+		run: func() bool {
+			m := NewMultiReader(1, newFlakySRC("ok"))
+			buf := make([]byte, 2)
+			n, err := m.Read(buf)
+			return err == nil && n == 2 && string(buf) == "ok"
+		},
+	},
+	{
+		name: "Большие данные: полное чтение и чтение через границы",
+		run: func() bool {
+			// Сгенерируем несколько «больших» источников по ~1–2KB суммарно
+			s1 := strings.Repeat("A", 1024)
+			s2 := strings.Repeat("B", 768)
+			s3 := strings.Repeat("C", 512)
+			a := newMockStringsReader(s1)
+			b := newMockStringsReader(s2)
+			c := newMockStringsReader(s3)
+			m := NewMultiReader(4, a, b, c)
+
+			// Полное чтение и сравнение
+			expected := s1 + s2 + s3
+			buf := make([]byte, len(expected))
+			n, err := m.Read(buf)
+			if err != nil || n != len(expected) || string(buf) != expected {
+				return false
+			}
+
+			// Seek в конце первого ридера минус 10, прочитать 20 байт — пересекаем границу A->B
+			if _, err := m.Seek(int64(len(s1)-10), io.SeekStart); err != nil {
+				return false
+			}
+			buf2 := make([]byte, 20)
+			n, err = m.Read(buf2)
+			if err != nil || n != 20 {
+				return false
+			}
+			if string(buf2) != strings.Repeat("A", 10)+strings.Repeat("B", 10) {
+				return false
+			}
+
+			// Seek на конец второго ридера минус 5, прочитать 15 — пересекаем границу B->C
+			offset := int64(len(s1) + len(s2) - 5)
+			if _, err := m.Seek(offset, io.SeekStart); err != nil {
+				return false
+			}
+			buf3 := make([]byte, 15)
+			n, err = m.Read(buf3)
+			if err != nil || n != 15 {
+				return false
+			}
+			if string(buf3) != strings.Repeat("B", 5)+strings.Repeat("C", 10) {
+				return false
+			}
+			return true
 		},
 	},
 }

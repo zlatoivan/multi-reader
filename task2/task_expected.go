@@ -205,17 +205,17 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	}
 
 	// Попадание внутрь эффективного окна (учитывая уже потреблённую часть головы)
-	effectiveStart := m.bufferStart + int64(m.consumedInHead)
-	// вычислим общий объём оставшихся байт в окне
-	var remaining int64
+	effectiveStart := m.bufferStart
+	// вычислим общий объём доступных байт в окне (включая уже потреблённую часть головы)
+	var available int64
 	if m.count > 0 {
-		remaining += int64(m.chunks[m.head].n - m.consumedInHead)
+		available += int64(m.chunks[m.head].n)
 		for i := 1; i < m.count; i++ {
 			idx := (m.head + i) % m.buffersNum
-			remaining += int64(m.chunks[idx].n)
+			available += int64(m.chunks[idx].n)
 		}
 	}
-	effectiveEnd := effectiveStart + remaining
+	effectiveEnd := effectiveStart + available
 	if seekPos >= effectiveStart && seekPos < effectiveEnd {
 		// вычисляем смещение от начала окна и находим соответствующий чанк
 		delta := int(seekPos - m.bufferStart)
@@ -373,7 +373,7 @@ func (m *MultiReader) prefetchLoop() {
 		}
 
 		remainInReader := int(m.prefixSizes[curReaderIdx+1] - curPos)
-		toRead := max(bufferSize, remainInReader)
+		toRead := min(bufferSize, remainInReader)
 		buf := make([]byte, toRead)
 		n, readErr := reader.Read(buf)
 

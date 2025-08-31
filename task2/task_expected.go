@@ -108,8 +108,9 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 	}
 
 	m.cond.L.Lock()
+	defer m.cond.L.Unlock()
+
 	if m.closed {
-		m.cond.L.Unlock()
 		return 0, io.ErrClosedPipe
 	}
 	// Ленивая инициализация префетчера
@@ -122,10 +123,8 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 		// Достигнут общий EOF
 		if m.absPos == m.totalSize {
 			if n == 0 {
-				m.cond.L.Unlock()
 				return 0, io.EOF
 			}
-			m.cond.L.Unlock()
 			return n, nil
 		}
 
@@ -164,24 +163,20 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 		// Переход к ошибке/EOF от префетчера
 		if m.prefetchErr != nil {
 			if n > 0 {
-				m.cond.L.Unlock()
 				return n, nil
 			}
 			err := m.prefetchErr
-			m.cond.L.Unlock()
 			return 0, err
 		}
 
 		// Пока данных нет — ждём пополнение
 		if m.closed {
-			m.cond.L.Unlock()
 			return n, io.ErrClosedPipe
 		}
 
 		m.cond.Wait()
 	}
 
-	m.cond.L.Unlock()
 	return n, nil
 }
 
@@ -189,8 +184,9 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 // При выходе за окно — сброс буфера и переинициализация префетча с новой позиции.
 func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	m.cond.L.Lock()
+	defer m.cond.L.Unlock()
+
 	if m.closed {
-		m.cond.L.Unlock()
 		return 0, io.ErrClosedPipe
 	}
 
@@ -203,20 +199,17 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekEnd:
 		base = m.totalSize
 	default:
-		m.cond.L.Unlock()
 		return 0, fmt.Errorf("invalid whence: %d", whence)
 	}
 
 	seekPos := base + offset
 	if seekPos < 0 || seekPos > m.totalSize { // позиция == totalSize допустима (EOF)
-		m.cond.L.Unlock()
 		return 0, fmt.Errorf("seek position (%d) should be >= 0 and <= totalSize (%d)", seekPos, m.totalSize)
 	}
 
 	// Внутри окна — просто двигаем абс. позицию
 	if seekPos >= m.bufferStart && seekPos <= m.bufferStart+int64(len(m.bufferData)) {
 		m.absPos = seekPos
-		m.cond.L.Unlock()
 		return seekPos, nil
 	}
 
@@ -228,7 +221,6 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	m.pfPos = seekPos
 	m.pfNeedSeek = true
 	m.cond.Broadcast()
-	m.cond.L.Unlock()
 
 	return seekPos, nil
 }

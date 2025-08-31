@@ -20,7 +20,7 @@ const (
 	// Это «порция» чтения префетчером; влияет на частоту I/O.
 	bufferSize = 1024 * 1024
 	// defaultBuffersNum — количество блоков в окне буфера.
-	// Итоговая ёмкость буфера: bufferSize * defaultBuffersNum.
+	// Итоговая ёмкость буфера: defaultBuffersNum * bufferSize.
 	defaultBuffersNum = 4
 )
 
@@ -61,7 +61,11 @@ var _ SizedReadSeekCloser = (*MultiReader)(nil)
 
 // NewMultiReader создаёт конкатенированный ридер поверх набора SizedReadSeekCloser
 // с поддержкой асинхронного префетча. Префетчер запускается лениво при первом чтении.
-func NewMultiReader(readers ...SizedReadSeekCloser) *MultiReader {
+func NewMultiReader(buffersNum int, readers ...SizedReadSeekCloser) *MultiReader {
+	// нормализуем buffersNum
+	if buffersNum <= 0 {
+		buffersNum = defaultBuffersNum
+	}
 	// Считаем префиксные суммы и общий размер заранее
 	prefix := make([]int64, len(readers)+1)
 	var total int64
@@ -78,7 +82,7 @@ func NewMultiReader(readers ...SizedReadSeekCloser) *MultiReader {
 		absPos:           0,
 		bufferStart:      0,
 		bufferData:       nil,
-		bufferCap:        bufferSize * defaultBuffersNum,
+		bufferCap:        buffersNum * bufferSize,
 		closed:           false,
 		prefetchErr:      nil,
 		cond:             sync.NewCond(&sync.Mutex{}),

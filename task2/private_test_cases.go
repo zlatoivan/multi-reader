@@ -12,7 +12,7 @@ var privateTestCases = []TestCase{
 		run: func() bool {
 			a := newMockStringsReader("abc")
 			b := newMockStringsReader("def")
-			m := NewMultiReader(a, b)
+			m := NewMultiReader(4, a, b)
 
 			pos, err := m.Seek(-2, io.SeekEnd)
 			if err != nil || pos != 4 {
@@ -31,7 +31,7 @@ var privateTestCases = []TestCase{
 		name: "Seek от текущей позиции",
 		run: func() bool {
 			a := newMockStringsReader("abcd")
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 
 			buf := make([]byte, 1)
 			n, err := m.Read(buf)
@@ -55,7 +55,7 @@ var privateTestCases = []TestCase{
 		name: "Ошибочные варианты Seek",
 		run: func() bool {
 			a := newMockStringsReader("abc")
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 
 			if _, err := m.Seek(0, 99); err == nil {
 				return false
@@ -80,7 +80,7 @@ var privateTestCases = []TestCase{
 			a.closeErr = errA
 			b.closeErr = errB
 
-			m := NewMultiReader(a, b, c)
+			m := NewMultiReader(4, a, b, c)
 
 			err := m.Close()
 			if err == nil {
@@ -96,7 +96,7 @@ var privateTestCases = []TestCase{
 		name: "Read/Seek после Close",
 		run: func() bool {
 			a := newMockStringsReader("abc")
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 
 			err := m.Close()
 			if err != nil {
@@ -126,7 +126,7 @@ var privateTestCases = []TestCase{
 			tr1.sizeCalls = &calls
 			tr2.sizeCalls = &calls
 
-			m := NewMultiReader(tr1, tr2)
+			m := NewMultiReader(4, tr1, tr2)
 			if calls != 2 {
 				return false
 			}
@@ -144,7 +144,7 @@ var privateTestCases = []TestCase{
 			tr1.seekCalls = &seekCalls1
 			tr2.seekCalls = &seekCalls2
 
-			m := NewMultiReader(tr1, tr2)
+			m := NewMultiReader(4, tr1, tr2)
 
 			pos, err := m.Seek(4, io.SeekStart)
 			if err != nil || pos != 4 {
@@ -169,7 +169,7 @@ var privateTestCases = []TestCase{
 		name: "Seek на EOF допустим и Read возвращает EOF",
 		run: func() bool {
 			a := newMockStringsReader("data")
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 
 			size := m.Size()
 			pos, err := m.Seek(0, io.SeekEnd)
@@ -189,7 +189,7 @@ var privateTestCases = []TestCase{
 		name: "Read с нулевой длиной возвращает (0, nil)",
 		run: func() bool {
 			a := newMockStringsReader("xy")
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 			n, err := m.Read(nil)
 			return n == 0 && err == nil
 		},
@@ -200,7 +200,7 @@ var privateTestCases = []TestCase{
 			var seekCalls int
 			a := newMockStringsReader("hello world")
 			a.seekCalls = &seekCalls
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 			buf := make([]byte, 1)
 			// Старт чтения, префетчер станет активным и сделает первый Seek
 			if n, err := m.Read(buf); err != nil || n != 1 {
@@ -224,7 +224,7 @@ var privateTestCases = []TestCase{
 			var seekCalls int
 			a := newMockStringsReader("longstringdata")
 			a.seekCalls = &seekCalls
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 			buf := make([]byte, 5)
 			if n, err := m.Read(buf); err != nil || n != 5 { // прочитаем немного вперёд
 				return false

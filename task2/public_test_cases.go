@@ -17,7 +17,7 @@ var testCases = []TestCase{
 		run: func() bool {
 			a := newMockStringsReader("abc")
 			b := newMockStringsReader("defg")
-			m := NewMultiReader(a, b)
+			m := NewMultiReader(4, a, b)
 
 			if m.Size() != int64(7) {
 				return false
@@ -38,7 +38,7 @@ var testCases = []TestCase{
 		name: "Поведение EOF",
 		run: func() bool {
 			a := newMockStringsReader("hi")
-			m := NewMultiReader(a)
+			m := NewMultiReader(4, a)
 			buf := make([]byte, 2)
 
 			n, err := m.Read(buf)
@@ -58,7 +58,7 @@ var testCases = []TestCase{
 		run: func() bool {
 			a := newMockStringsReader("hello")
 			b := newMockStringsReader("-world-")
-			m := NewMultiReader(a, b)
+			m := NewMultiReader(4, a, b)
 
 			pos, err := m.Seek(3, io.SeekStart)
 			if err != nil || pos != 3 {

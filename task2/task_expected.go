@@ -22,6 +22,8 @@ const (
 	// defaultBuffersNum — количество блоков в окне буфера.
 	// Итоговая ёмкость буфера: defaultBuffersNum * bufferSize.
 	defaultBuffersNum = 4
+	// startChunkSize — размер первого чанка (soft-start), удваиваем до bufferSize
+	startChunkSize = 64 * 1024
 )
 
 // MultiReader объединяет несколько SizedReadSeekCloser в единый конкатенированный поток
@@ -35,11 +37,18 @@ type MultiReader struct {
 	// Текущая логическая позиция чтения (для пользователя)
 	absPos int64
 
-	// Окно буфера префетча: [bufferStart, bufferStart+len(bufferData))
-	// Все чтения идут только из этого окна.
-	bufferStart int64
-	bufferData  []byte
-	bufferCap   int
+	// Кольцевое окно из чанков фиксированного размера
+	bufferStart    int64 // абсолютная позиция начала окна
+	chunks         []chunk
+	head           int
+	tail           int
+	count          int
+	consumedInHead int   // потреблено байт в головном чанке
+	windowBytes    int64 // суммарный объём байт в окне
+	buffersNum     int
+	bufferCap      int // целевой размер окна в байтах = bufferSize * buffersNum
+	pool           sync.Pool
+	curChunkSz     int
 
 	// Состояние
 	closed      bool
@@ -56,6 +65,11 @@ type MultiReader struct {
 	pfNeedSeek bool // префетчер должен сделать Seek на pfPos перед чтением
 }
 
+type chunk struct {
+	buf []byte
+	n   int
+}
+
 // Проверка, что MultiReader удовлетворяет интерфейсу SizedReadSeekCloser
 var _ SizedReadSeekCloser = (*MultiReader)(nil)
 
@@ -66,22 +80,28 @@ func NewMultiReader(buffersNum int, readers ...SizedReadSeekCloser) *MultiReader
 	if buffersNum <= 0 {
 		buffersNum = defaultBuffersNum
 	}
-	// Считаем префиксные суммы и общий размер заранее
-	prefix := make([]int64, len(readers)+1)
+	// Считаем префиксные суммы и общий размер заранее — понадобится для быстрого поиска активного ридера
+	prefixSizes := make([]int64, len(readers)+1)
 	var total int64
 	for i, r := range readers {
-		prefix[i] = total
+		prefixSizes[i] = total
 		total += r.Size()
 	}
-	prefix[len(readers)] = total
+	prefixSizes[len(readers)] = total
 
 	return &MultiReader{
 		readers:          readers,
 		totalSize:        total,
-		prefixSizes:      prefix,
+		prefixSizes:      prefixSizes,
 		absPos:           0,
 		bufferStart:      0,
-		bufferData:       nil,
+		chunks:           make([]chunk, buffersNum), // кольцевой буфер чанков фиксированной длины
+		head:             0,
+		tail:             0,
+		count:            0,
+		consumedInHead:   0,
+		windowBytes:      0,
+		buffersNum:       buffersNum,
 		bufferCap:        buffersNum * bufferSize,
 		closed:           false,
 		prefetchErr:      nil,
@@ -91,6 +111,8 @@ func NewMultiReader(buffersNum int, readers ...SizedReadSeekCloser) *MultiReader
 		prefetchDone:     nil,
 		pfPos:            0,
 		pfNeedSeek:       true,
+		curChunkSz:       startChunkSize,                                                 // soft-start: начнём с малого чанка
+		pool:             sync.Pool{New: func() any { return make([]byte, bufferSize) }}, // // Пул буферов для снижения аллокаций: каждый буфер рассчитан на максимум chunkSize
 	}
 }
 
@@ -99,11 +121,7 @@ func (m *MultiReader) Size() int64 {
 	return m.totalSize
 }
 
-// Read читает данные из внутреннего буфера. Префетч запускается при первом чтении.
-// Алгоритм:
-// 1) Если буфер содержит нужные байты — копируем их и сдвигаем окно.
-// 2) Если буфер пуст и нет ошибки — ждём пополнения от префетчера.
-// 3) Если префетчер установил ошибку/EOF — возвращаем частично прочитанное или ошибку.
+// Read читает данные из внутреннего буфера (очереди чанков).
 func (m *MultiReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -115,14 +133,14 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 	if m.closed {
 		return 0, io.ErrClosedPipe
 	}
-	// Ленивая инициализация префетчера
+	// Ленивая инициализация префетчера — до первого реального чтения
 	if !m.prefetchStarted {
 		m.startPrefetchLocked()
 	}
 
 	n := 0
 	for n < len(p) {
-		// Достигнут общий EOF
+		// Достигнут общий EOF — больше данных не будет
 		if m.absPos == m.totalSize {
 			if n == 0 {
 				return 0, io.EOF
@@ -130,60 +148,49 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 			return n, nil
 		}
 
-		// Пытаемся прочитать из окна
-		offset := m.absPos - m.bufferStart
-		if offset >= 0 && offset < int64(len(m.bufferData)) {
-			available := int64(len(m.bufferData)) - offset
-			need := int64(len(p) - n)
-			toCopy := need
-			if available < toCopy {
-				toCopy = available
-			}
-			if toCopy > 0 {
-				// Копируем из буфера наружу
-				copy(p[n:n+int(toCopy)], m.bufferData[offset:offset+toCopy])
-				n += int(toCopy)
-				m.absPos += toCopy
-
-				// Сдвигаем окно на уже прочитанные байты
-				consumed := m.absPos - m.bufferStart
-				if consumed > 0 {
-					if consumed >= int64(len(m.bufferData)) {
-						m.bufferData = nil
-						m.bufferStart = m.absPos
-					} else {
-						m.bufferData = m.bufferData[consumed:]
-						m.bufferStart += consumed
-					}
+		// Данных нет либо голова исчерпана — ждём пополнения/ошибки
+		if m.count == 0 || (m.count > 0 && m.consumedInHead >= m.chunks[m.head].n) {
+			if m.prefetchErr != nil {
+				if n > 0 {
+					return n, nil
 				}
-				// Освободили место — будим префетч
-				m.cond.Broadcast()
-				continue
+				return 0, m.prefetchErr
 			}
+			m.cond.Wait()
+			continue
 		}
 
-		// Переход к ошибке/EOF от префетчера
-		if m.prefetchErr != nil {
-			if n > 0 {
-				return n, nil
-			}
-			err := m.prefetchErr
-			return 0, err
+		// Копируем из головного чанка и сдвигаем окно
+		ch := &m.chunks[m.head]
+		available := ch.n - m.consumedInHead
+		need := len(p) - n
+		toCopy := available
+		if toCopy > need {
+			toCopy = need
 		}
+		copy(p[n:n+toCopy], ch.buf[m.consumedInHead:m.consumedInHead+toCopy])
+		n += toCopy
+		m.absPos += int64(toCopy)
+		m.consumedInHead += toCopy
+		m.windowBytes -= int64(toCopy)
 
-		// Пока данных нет — ждём пополнение
-		if m.closed {
-			return n, io.ErrClosedPipe
+		// Если головной чанк закончился — возвращаем буфер в pool, освобождаем слот, сдвигаем head
+		if m.consumedInHead == ch.n {
+			m.pool.Put(ch.buf[:cap(ch.buf)])
+			m.bufferStart += int64(ch.n)
+			m.head = (m.head + 1) % m.buffersNum
+			m.count--
+			m.consumedInHead = 0
+			*ch = chunk{}
+			m.cond.Broadcast() // разбудим префетчер, если он ждал свободного слота
 		}
-
-		m.cond.Wait()
 	}
 
 	return n, nil
 }
 
-// Seek перемещает курсор. Позиции внутри текущего окна обслуживаются из буфера.
-// При выходе за окно — сброс буфера и переинициализация префетча с новой позиции.
+// Seek перемещает курсор. Если позиция внутри текущего окна — переиндексируем чанк/смещение.
+// Иначе очищаем окно и перезапускаем префетч с новой позиции.
 func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	m.cond.L.Lock()
 	defer m.cond.L.Unlock()
@@ -205,24 +212,59 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	}
 
 	seekPos := base + offset
-	if seekPos < 0 || seekPos > m.totalSize { // позиция == totalSize допустима (EOF)
+	if seekPos < 0 || seekPos > m.totalSize {
 		return 0, fmt.Errorf("seek position (%d) should be >= 0 and <= totalSize (%d)", seekPos, m.totalSize)
 	}
 
-	// Внутри окна — просто двигаем абс. позицию
-	if seekPos >= m.bufferStart && seekPos <= m.bufferStart+int64(len(m.bufferData)) {
-		m.absPos = seekPos
-		return seekPos, nil
+	// Попадание внутрь эффективного окна (учитывая уже потреблённую часть головы)
+	effectiveStart := m.bufferStart + int64(m.consumedInHead)
+	effectiveEnd := m.bufferStart + m.windowBytes
+	if seekPos >= effectiveStart && seekPos < effectiveEnd {
+		// вычисляем смещение от начала окна и находим соответствующий чанк
+		delta := seekPos - m.bufferStart
+		idx := m.head
+		consumed := int(delta)
+		for i := 0; i < m.count; i++ {
+			ch := &m.chunks[idx]
+			if consumed < ch.n {
+				m.head = idx
+				m.consumedInHead = consumed
+				m.absPos = seekPos
+				// пересчитаем остаток окна от новой головы
+				var wb int64
+				j := m.head
+				c := m.count
+				remHead := m.chunks[m.head].n - m.consumedInHead
+				wb += int64(remHead)
+				for k := 1; k < c; k++ {
+					j = (j + 1) % m.buffersNum
+					wb += int64(m.chunks[j].n)
+				}
+				m.windowBytes = wb
+				return seekPos, nil
+			}
+			consumed -= ch.n
+			idx = (idx + 1) % m.buffersNum
+		}
 	}
 
-	// Вне окна — сброс и команда префетчеру начать с новой позиции
-	m.absPos = seekPos
+	// Вне окна — сбрасываем очередь и перезапускаем префетч с новой позиции
+	for m.count > 0 {
+		ch := &m.chunks[m.head]
+		m.pool.Put(ch.buf[:cap(ch.buf)])
+		*ch = chunk{}
+		m.head = (m.head + 1) % m.buffersNum
+		m.count--
+	}
+	m.tail = m.head
+	m.consumedInHead = 0
 	m.bufferStart = seekPos
-	m.bufferData = nil
+	m.windowBytes = 0
 	m.prefetchErr = nil
 	m.pfPos = seekPos
 	m.pfNeedSeek = true
 	m.cond.Broadcast()
+	m.absPos = seekPos
 
 	return seekPos, nil
 }
@@ -276,7 +318,7 @@ func (m *MultiReader) startPrefetchLocked() {
 	go m.prefetchLoop()
 }
 
-// Внутреннее: горутина префетча. Читает порциями вперёд и добавляет данные в буфер.
+// Внутреннее: горутина префетча. Наполняет очередь чанков.
 // Соблюдает backpressure: если буфер полон — ждёт; если данных нет — добавляет и будит читателя.
 func (m *MultiReader) prefetchLoop() {
 	defer func() {
@@ -291,22 +333,26 @@ func (m *MultiReader) prefetchLoop() {
 	var curPos int64
 	curReaderIdx := -1
 	needSeek := true
+	chunkSz := m.curChunkSz
+	if chunkSz <= 0 {
+		chunkSz = startChunkSize
+	}
 
 	for {
 		m.cond.L.Lock()
-		// Остановка по Close() или явному флагу
+		// Остановка по Close()/флагу
 		if m.closed || m.prefetchStopping {
 			m.cond.L.Unlock()
 			return
 		}
-		// Перезапуск (после Seek)
+		// Перезапуск после Seek
 		if m.pfNeedSeek {
 			curPos = m.pfPos
 			curReaderIdx = -1
 			needSeek = true
 			m.pfNeedSeek = false
 		}
-		// Конец общего потока
+		// Дошли до конца общего потока
 		if curPos >= m.totalSize {
 			if m.prefetchErr == nil {
 				m.prefetchErr = io.EOF
@@ -315,19 +361,13 @@ func (m *MultiReader) prefetchLoop() {
 			m.cond.L.Unlock()
 			return
 		}
-		// Буфер заполнен — ждём, когда читатель освободит место
-		if len(m.bufferData) >= m.bufferCap {
+		// Нет места в окне — ждём, пока читатель освободит слот (backpressure)
+		if m.count == m.buffersNum {
 			m.cond.Wait()
 			m.cond.L.Unlock()
 			continue
 		}
-
-		// Рассчитаем размер порции и активный ридер по префиксным суммам
-		spaceLeft := m.bufferCap - len(m.bufferData)
-		toRead := bufferSize
-		if toRead > spaceLeft {
-			toRead = spaceLeft
-		}
+		// Определяем активный источник по префиксным суммам
 		if curReaderIdx < 0 || !(m.prefixSizes[curReaderIdx] <= curPos && curPos < m.prefixSizes[curReaderIdx+1]) {
 			idx := sort.Search(len(m.readers), func(i int) bool { return m.prefixSizes[i+1] > curPos })
 			curReaderIdx = idx
@@ -335,14 +375,15 @@ func (m *MultiReader) prefetchLoop() {
 		}
 		localOffset := curPos - m.prefixSizes[curReaderIdx]
 		remainInReader := int(m.prefixSizes[curReaderIdx+1] - curPos)
+		toRead := chunkSz
 		if toRead > remainInReader {
 			toRead = remainInReader
 		}
 		reader := m.readers[curReaderIdx]
+		m.cond.L.Unlock()
 
-		// Seek/Read выполняем вне критической секции, чтобы не блокировать читателя
+		// Seek/Read выполняем без удержания лока, чтобы не блокировать читателя
 		if needSeek {
-			m.cond.L.Unlock()
 			_, seekErr := reader.Seek(localOffset, io.SeekStart)
 			m.cond.L.Lock()
 			if m.closed || m.prefetchStopping {
@@ -356,46 +397,56 @@ func (m *MultiReader) prefetchLoop() {
 				return
 			}
 			needSeek = false
+			m.cond.L.Unlock()
 		}
 
-		buf := make([]byte, toRead)
-		m.cond.L.Unlock()
-		n, err := reader.Read(buf)
-		if n > 0 {
-			buf = buf[:n]
-		} else {
-			buf = buf[:0]
+		buf := m.pool.Get().([]byte)
+		if cap(buf) < toRead {
+			buf = make([]byte, toRead)
 		}
+		buf = buf[:toRead]
+		n, readErr := reader.Read(buf)
 
 		m.cond.L.Lock()
 		if m.closed || m.prefetchStopping {
 			m.cond.L.Unlock()
 			return
 		}
+		// Если за время I/O пришёл новый Seek — отбрасываем чанк и начинаем с новой позиции
+		if m.pfNeedSeek {
+			m.pool.Put(buf[:cap(buf)])
+			curPos = m.pfPos
+			curReaderIdx = -1
+			needSeek = true
+			m.pfNeedSeek = false
+			m.cond.L.Unlock()
+			continue
+		}
 		if n > 0 {
-			// Добавляем данные в конец окна и, если нужно, подчищаем голову
-			m.bufferData = append(m.bufferData, buf...)
-			overflow := len(m.bufferData) - m.bufferCap
-			if overflow > 0 {
-				maxTrim := int(m.absPos - m.bufferStart)
-				if maxTrim < 0 {
-					maxTrim = 0
-				}
-				if overflow > maxTrim {
-					overflow = maxTrim
-				}
-				if overflow > 0 {
-					m.bufferData = m.bufferData[overflow:]
-					m.bufferStart += int64(overflow)
+			// Кладём чанк в конец окна
+			ch := &m.chunks[m.tail]
+			ch.buf = buf[:n]
+			ch.n = n
+			m.tail = (m.tail + 1) % m.buffersNum
+			m.count++
+			m.windowBytes += int64(n)
+			curPos += int64(n)
+			// soft-start: постепенно растим размер чанка до bufferSize
+			if chunkSz < bufferSize {
+				chunkSz *= 2
+				if chunkSz > bufferSize {
+					chunkSz = bufferSize
 				}
 			}
-			curPos += int64(n)
-			m.cond.Broadcast()
+			m.cond.Broadcast() // разбудим читателя
+		} else {
+			// Ничего не прочитали — возвращаем буфер в pool
+			m.pool.Put(buf[:cap(buf)])
 		}
 
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// Закончился текущий ридер: перейти к началу следующего
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				// // Закончился текущий ридер: перейти к началу следующего, либо фиксируем общий EOF
 				if curPos < m.prefixSizes[curReaderIdx+1] {
 					curPos = m.prefixSizes[curReaderIdx+1]
 					curReaderIdx = -1
@@ -416,17 +467,11 @@ func (m *MultiReader) prefetchLoop() {
 				m.cond.L.Unlock()
 				continue
 			}
-			// Любая другая ошибка
-			m.prefetchErr = err
+			// Любая другая ошибка источника
+			m.prefetchErr = readErr
 			m.cond.Broadcast()
 			m.cond.L.Unlock()
 			return
-		}
-
-		if n == 0 {
-			// Избежим холостого цикла: кратко подождём сигналов
-			m.cond.Broadcast()
-			m.cond.Wait()
 		}
 		m.cond.L.Unlock()
 	}

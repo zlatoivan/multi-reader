@@ -1,13 +1,11 @@
-// Пакет main содержит реализацию MultiReader с асинхронным префетчем (фоновой подкачкой)
-// для объединённого чтения из нескольких источников данных как из одного потока.
 package main
 
 import (
-	"errors" // объединение ошибок и проверка io.EOF
-	"fmt"    // форматирование сообщений об ошибках
-	"io"     // стандартные интерфейсы ввода/вывода
-	"sort"   // бинарный поиск по префиксным суммам
-	"sync"   // мьютексы и условные переменные
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"sync"
 )
 
 // SizedReadSeekCloser - интерфейс ридера с возможностью seek и знанием своего размера.
@@ -277,7 +275,14 @@ func (m *MultiReader) startPrefetchLocked() {
 // Внутреннее: горутина префетча. Читает порциями вперёд и добавляет данные в буфер.
 // Соблюдает backpressure: если буфер полон — ждёт; если данных нет — добавляет и будит читателя.
 func (m *MultiReader) prefetchLoop() {
-	defer close(m.prefetchDone)
+	defer func() {
+		// Пометим, что префетчер завершился, чтобы Read мог перезапустить его при необходимости
+		m.cond.L.Lock()
+		m.prefetchStarted = false
+		m.cond.Broadcast()
+		m.cond.L.Unlock()
+		close(m.prefetchDone)
+	}()
 
 	var curPos int64
 	curReaderIdx := -1

@@ -185,4 +185,60 @@ var privateTestCases = []TestCase{
 			return errors.Is(err, io.EOF)
 		},
 	},
+	{
+		name: "Read с нулевой длиной возвращает (0, nil)",
+		run: func() bool {
+			a := newMockStringsReader("xy")
+			m := NewMultiReader(a)
+			n, err := m.Read(nil)
+			return n == 0 && err == nil
+		},
+	},
+	{
+		name: "Seek внутри буферного окна не вызывает нижний Seek",
+		run: func() bool {
+			var seekCalls int
+			a := newMockStringsReader("hello world")
+			a.seekCalls = &seekCalls
+			m := NewMultiReader(a)
+			buf := make([]byte, 1)
+			// Старт чтения, префетчер станет активным и сделает первый Seek
+			if n, err := m.Read(buf); err != nil || n != 1 {
+				return false
+			}
+			before := seekCalls
+			// Переход вперёд на 1 байт — должен быть внутри уже буферизованного окна
+			if _, err := m.Seek(1, io.SeekCurrent); err != nil {
+				return false
+			}
+			// Следующее чтение должно прийти из буфера, без новых Seek в источнике
+			if n, err := m.Read(buf); err != nil || n != 1 {
+				return false
+			}
+			return seekCalls == before
+		},
+	},
+	{
+		name: "Seek назад за пределы окна инициирует новый нижний Seek",
+		run: func() bool {
+			var seekCalls int
+			a := newMockStringsReader("longstringdata")
+			a.seekCalls = &seekCalls
+			m := NewMultiReader(a)
+			buf := make([]byte, 5)
+			if n, err := m.Read(buf); err != nil || n != 5 { // прочитаем немного вперёд
+				return false
+			}
+			before := seekCalls
+			// Сильно назад — за границы текущего окна (bufferStart уже сдвинут вперёд)
+			if _, err := m.Seek(0, io.SeekStart); err != nil {
+				return false
+			}
+			// Первое же чтение должно потребовать нижний Seek
+			if n, err := m.Read(buf[:1]); err != nil || n != 1 {
+				return false
+			}
+			return seekCalls > before
+		},
+	},
 }

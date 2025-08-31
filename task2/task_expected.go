@@ -62,32 +62,32 @@ var _ SizedReadSeekCloser = (*MultiReader)(nil)
 // NewMultiReader создаёт конкатенированный ридер поверх набора SizedReadSeekCloser
 // с поддержкой асинхронного префетча. Префетчер запускается лениво при первом чтении.
 func NewMultiReader(readers ...SizedReadSeekCloser) *MultiReader {
-	mr := &MultiReader{
-		readers:    readers,
-		bufferCap:  bufferSize * defaultBuffersNum,
-		pfNeedSeek: true,
-	}
-	// Привязываем cond к мьютексу — это механизм ожидания/пробуждения
-	mr.cond = sync.NewCond(&sync.Mutex{})
-
-	// Подготовим префиксные суммы и totalSize
-	mr.prefixSizes = make([]int64, len(readers)+1)
+	// Считаем префиксные суммы и общий размер заранее
+	prefix := make([]int64, len(readers)+1)
 	var total int64
-	for i, r := range mr.readers {
-		mr.prefixSizes[i] = total
+	for i, r := range readers {
+		prefix[i] = total
 		total += r.Size()
 	}
-	mr.prefixSizes[len(readers)] = total
-	mr.totalSize = total
+	prefix[len(readers)] = total
 
-	// Начальные значения для курсора и буфера
-	mr.absPos = 0
-	mr.bufferStart = 0
-	mr.bufferData = nil
-	mr.prefetchErr = nil
-	mr.pfPos = 0
-
-	return mr
+	return &MultiReader{
+		readers:          readers,
+		totalSize:        total,
+		prefixSizes:      prefix,
+		absPos:           0,
+		bufferStart:      0,
+		bufferData:       nil,
+		bufferCap:        bufferSize * defaultBuffersNum,
+		closed:           false,
+		prefetchErr:      nil,
+		cond:             sync.NewCond(&sync.Mutex{}),
+		prefetchStarted:  false,
+		prefetchStopping: false,
+		prefetchDone:     nil,
+		pfPos:            0,
+		pfNeedSeek:       true,
+	}
 }
 
 // Size возвращает суммарный размер всех ридеров.

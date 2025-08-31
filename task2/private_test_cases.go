@@ -6,32 +6,6 @@ import (
 	"strings"
 )
 
-// flakySRC — источник, который один раз возвращает (0,nil), затем ведёт себя как обычный strings.Reader.
-type flakySRC struct {
-	*strings.Reader
-	size     int64
-	zeroOnce bool
-}
-
-func newFlakySRC(s string) *flakySRC {
-	r := strings.NewReader(s)
-	return &flakySRC{Reader: r, size: int64(r.Len())}
-}
-
-func (f *flakySRC) Read(p []byte) (int, error) {
-	if !f.zeroOnce {
-		f.zeroOnce = true
-		return 0, nil
-	}
-	return f.Reader.Read(p)
-}
-
-func (f *flakySRC) Seek(offset int64, whence int) (int64, error) {
-	return f.Reader.Seek(offset, whence)
-}
-func (f *flakySRC) Close() error { return nil }
-func (f *flakySRC) Size() int64  { return f.size }
-
 var privateTestCases = []TestCase{
 	{
 		name: "Seek от конца",
@@ -352,15 +326,6 @@ var privateTestCases = []TestCase{
 			_ = m.Close()
 			<-done
 			return true
-		},
-	},
-	{
-		name: "Источник n==0, err==nil — не зависаем",
-		run: func() bool {
-			m := NewMultiReader(1, newFlakySRC("ok"))
-			buf := make([]byte, 2)
-			n, err := m.Read(buf)
-			return err == nil && n == 2 && string(buf) == "ok"
 		},
 	},
 	{

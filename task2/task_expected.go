@@ -48,8 +48,7 @@ type MultiReader struct {
 	prefetchErr error // последняя ошибка источника (включая EOF)
 
 	// Синхронизация и управление жизненным циклом префетчера
-	mu               sync.Mutex
-	cond             *sync.Cond // условная переменная для координации читателя и продюсера
+	cond             *sync.Cond // условная переменная для координации читателя и продюсера; используем cond.L как единственный локер
 	prefetchStarted  bool
 	prefetchStopping bool
 	prefetchDone     chan struct{} // канал для ожидания завершения горутины префетчера
@@ -70,8 +69,8 @@ func NewMultiReader(readers ...SizedReadSeekCloser) *MultiReader {
 		bufferCap:  bufferSize * defaultBuffersNum,
 		pfNeedSeek: true,
 	}
-	// Привязываем cond к общему мьютексу — это механизм ожидания/пробуждения
-	mr.cond = sync.NewCond(&mr.mu)
+	// Привязываем cond к мьютексу — это механизм ожидания/пробуждения
+	mr.cond = sync.NewCond(&sync.Mutex{})
 
 	// Подготовим префиксные суммы и totalSize
 	mr.prefixSizes = make([]int64, len(readers)+1)
@@ -108,9 +107,9 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	m.mu.Lock()
+	m.cond.L.Lock()
 	if m.closed {
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 		return 0, io.ErrClosedPipe
 	}
 	// Ленивая инициализация префетчера
@@ -123,10 +122,10 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 		// Достигнут общий EOF
 		if m.absPos == m.totalSize {
 			if n == 0 {
-				m.mu.Unlock()
+				m.cond.L.Unlock()
 				return 0, io.EOF
 			}
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			return n, nil
 		}
 
@@ -165,33 +164,33 @@ func (m *MultiReader) Read(p []byte) (int, error) {
 		// Переход к ошибке/EOF от префетчера
 		if m.prefetchErr != nil {
 			if n > 0 {
-				m.mu.Unlock()
+				m.cond.L.Unlock()
 				return n, nil
 			}
 			err := m.prefetchErr
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			return 0, err
 		}
 
 		// Пока данных нет — ждём пополнение
 		if m.closed {
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			return n, io.ErrClosedPipe
 		}
 
 		m.cond.Wait()
 	}
 
-	m.mu.Unlock()
+	m.cond.L.Unlock()
 	return n, nil
 }
 
 // Seek перемещает курсор. Позиции внутри текущего окна обслуживаются из буфера.
 // При выходе за окно — сброс буфера и переинициализация префетча с новой позиции.
 func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
-	m.mu.Lock()
+	m.cond.L.Lock()
 	if m.closed {
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 		return 0, io.ErrClosedPipe
 	}
 
@@ -204,20 +203,20 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekEnd:
 		base = m.totalSize
 	default:
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 		return 0, fmt.Errorf("invalid whence: %d", whence)
 	}
 
 	seekPos := base + offset
 	if seekPos < 0 || seekPos > m.totalSize { // позиция == totalSize допустима (EOF)
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 		return 0, fmt.Errorf("seek position (%d) should be >= 0 and <= totalSize (%d)", seekPos, m.totalSize)
 	}
 
 	// Внутри окна — просто двигаем абс. позицию
 	if seekPos >= m.bufferStart && seekPos <= m.bufferStart+int64(len(m.bufferData)) {
 		m.absPos = seekPos
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 		return seekPos, nil
 	}
 
@@ -229,16 +228,17 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	m.pfPos = seekPos
 	m.pfNeedSeek = true
 	m.cond.Broadcast()
-	m.mu.Unlock()
+	m.cond.L.Unlock()
+
 	return seekPos, nil
 }
 
 // Close завершает префетч и закрывает все источники, агрегируя ошибки.
 // Сценарий: ставим флаг закрытия, будим префетчер, ждём его завершения, затем закрываем ридеры.
 func (m *MultiReader) Close() error {
-	m.mu.Lock()
+	m.cond.L.Lock()
 	if m.closed {
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 		return nil
 	}
 
@@ -248,7 +248,7 @@ func (m *MultiReader) Close() error {
 		m.cond.Broadcast()
 	}
 	done := m.prefetchDone
-	m.mu.Unlock()
+	m.cond.L.Unlock()
 
 	if done != nil {
 		<-done
@@ -265,10 +265,11 @@ func (m *MultiReader) Close() error {
 	if multiErr != nil {
 		return fmt.Errorf("error when closing: %w", multiErr)
 	}
+
 	return nil
 }
 
-// Внутреннее: запуск префетчера. Требует удержания m.mu.
+// Внутреннее: запуск префетчера. Требует удержания блокировки cond.L.
 // Подготавливает начальные параметры и стартует горутину-продюсера.
 func (m *MultiReader) startPrefetchLocked() {
 	if m.prefetchStarted {
@@ -291,10 +292,10 @@ func (m *MultiReader) prefetchLoop() {
 	needSeek := true
 
 	for {
-		m.mu.Lock()
+		m.cond.L.Lock()
 		// Остановка по Close() или явному флагу
 		if m.closed || m.prefetchStopping {
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			return
 		}
 		// Перезапуск (после Seek)
@@ -310,13 +311,13 @@ func (m *MultiReader) prefetchLoop() {
 				m.prefetchErr = io.EOF
 			}
 			m.cond.Broadcast()
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			return
 		}
 		// Буфер заполнен — ждём, когда читатель освободит место
 		if len(m.bufferData) >= m.bufferCap {
 			m.cond.Wait()
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			continue
 		}
 
@@ -340,24 +341,24 @@ func (m *MultiReader) prefetchLoop() {
 
 		// Seek/Read выполняем вне критической секции, чтобы не блокировать читателя
 		if needSeek {
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			_, seekErr := reader.Seek(localOffset, io.SeekStart)
-			m.mu.Lock()
+			m.cond.L.Lock()
 			if m.closed || m.prefetchStopping {
-				m.mu.Unlock()
+				m.cond.L.Unlock()
 				return
 			}
 			if seekErr != nil {
 				m.prefetchErr = seekErr
 				m.cond.Broadcast()
-				m.mu.Unlock()
+				m.cond.L.Unlock()
 				return
 			}
 			needSeek = false
 		}
 
 		buf := make([]byte, toRead)
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 		n, err := reader.Read(buf)
 		if n > 0 {
 			buf = buf[:n]
@@ -365,9 +366,9 @@ func (m *MultiReader) prefetchLoop() {
 			buf = buf[:0]
 		}
 
-		m.mu.Lock()
+		m.cond.L.Lock()
 		if m.closed || m.prefetchStopping {
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			return
 		}
 		if n > 0 {
@@ -398,26 +399,26 @@ func (m *MultiReader) prefetchLoop() {
 					curPos = m.prefixSizes[curReaderIdx+1]
 					curReaderIdx = -1
 					needSeek = true
-					m.mu.Unlock()
+					m.cond.L.Unlock()
 					continue
 				}
 				// Конец общего потока
 				if curPos >= m.totalSize {
 					m.prefetchErr = io.EOF
 					m.cond.Broadcast()
-					m.mu.Unlock()
+					m.cond.L.Unlock()
 					return
 				}
 				// Иначе просто перейти к следующему ридеру
 				curReaderIdx = -1
 				needSeek = true
-				m.mu.Unlock()
+				m.cond.L.Unlock()
 				continue
 			}
 			// Любая другая ошибка
 			m.prefetchErr = err
 			m.cond.Broadcast()
-			m.mu.Unlock()
+			m.cond.L.Unlock()
 			return
 		}
 
@@ -426,6 +427,6 @@ func (m *MultiReader) prefetchLoop() {
 			m.cond.Broadcast()
 			m.cond.Wait()
 		}
-		m.mu.Unlock()
+		m.cond.L.Unlock()
 	}
 }

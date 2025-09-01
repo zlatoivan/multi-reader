@@ -206,7 +206,7 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("seek position (%d) should be >= 0 and <= totalSize (%d)", seekPos, m.totalSize)
 	}
 
-	// Попадание внутрь эффективного окна (один проход без предварительного суммирования)
+	// Попадание внутрь эффективного окна
 	effectiveStart := m.bufferStart + int64(m.consumedInHead)
 	seekDelta := int(seekPos - effectiveStart)
 	if seekDelta >= 0 && m.count > 0 {

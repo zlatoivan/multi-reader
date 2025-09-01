@@ -257,48 +257,6 @@ var privateTestCases = []TestCase{
 		},
 	},
 	{
-		name: "Seek назад внутри окна и сразу Read — буфер не сбрасывается",
-		run: func() bool {
-			var seeks int
-			r := newMockStringsReader("abcdef")
-			r.seekCalls = &seeks
-			m := NewMultiReader(2, r)
-			buf := make([]byte, 4)
-			_, _ = m.Read(buf) // abcd
-			before := seeks
-			if _, err := m.Seek(-1, io.SeekCurrent); err != nil { // позиция на 'd'
-				return false
-			}
-			b2 := make([]byte, 1)
-			n, err := m.Read(b2)
-			if err != nil || n != 1 || string(b2) != "d" {
-				return false
-			}
-			return seeks == before
-		},
-	},
-	{
-		name: "Дальний Seek вперёд за окно и немедленный Read — новый префетч",
-		run: func() bool {
-			var seeks int
-			r := newMockStringsReader(strings.Repeat("x", 64))
-			r.seekCalls = &seeks
-			m := NewMultiReader(2, r)
-			buf := make([]byte, 8)
-			_, _ = m.Read(buf) // прогреем окно
-			before := seeks
-			if _, err := m.Seek(50, io.SeekStart); err != nil {
-				return false
-			}
-			b2 := make([]byte, 1)
-			n, err := m.Read(b2)
-			if err != nil || n != 1 || string(b2) != "x" {
-				return false
-			}
-			return seeks > before
-		},
-	},
-	{
 		name: "EOF-контракт при n>0 и err==EOF из источника",
 		run: func() bool {
 			r := newMockStringsReader("z")

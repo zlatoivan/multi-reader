@@ -25,23 +25,22 @@ type MultiReader struct {
 
 // NewMultiReader создаёт конкатенированный ридер поверх набора SizedReadSeekCloser.
 func NewMultiReader(readers ...SizedReadSeekCloser) *MultiReader {
-	mr := &MultiReader{
-		readers: readers,
+	prefixSizes := make([]int64, len(readers)+1)
+	var total int64
+	for i, r := range readers {
+		prefixSizes[i] = total
+		total += r.Size()
 	}
+	prefixSizes[len(readers)] = total
 
-	mr.prefixSizes = make([]int64, len(readers)+1)
-	var totalSize int64
-	for i, r := range mr.readers {
-		mr.prefixSizes[i] = totalSize
-		totalSize += r.Size()
+	return &MultiReader{
+		readers:     readers,
+		totalSize:   total,
+		prefixSizes: prefixSizes,
+		absPos:      0,
+		needSeek:    true,
+		closed:      false,
 	}
-	mr.prefixSizes[len(readers)] = totalSize
-	mr.totalSize = totalSize
-
-	mr.absPos = 0
-	mr.needSeek = true
-
-	return mr
 }
 
 // Проверка, что MultiReader удовлетворяет интерфейсу SizedReadSeekCloser

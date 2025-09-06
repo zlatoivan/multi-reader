@@ -121,9 +121,6 @@ func (m *MultiReader) Read(p []byte) (n int, err error) {
 			// Канал данных закрыт - считываем итоговую ошибку/EOF
 			select {
 			case err = <-m.pfErrCh:
-				if err == nil { // канал ошибок закрыт без значения
-					err = io.EOF
-				}
 			default:
 				err = io.EOF
 			}
@@ -292,6 +289,7 @@ func (m *MultiReader) prefetchLoop(ctx context.Context, startPos int64) {
 		if n > 0 {
 			select {
 			case <-ctx.Done():
+				sendErr(pfErrCh, ctx.Err())
 				return
 			case pfBufCh <- buf[:n]: // Ждем, пока окно освободиться, чтобы записать следующий блок
 				curPos += int64(n) // Обновляем глобальную позицию на фактически прочитанные байты
@@ -328,26 +326,25 @@ func (m *MultiReader) readFromWindow(dst []byte) (int, bool) {
 	return toCopy, true
 }
 
-// sendErr отправляет ошибку в канал, если есть место
-func sendErr(errCh chan<- error, err error) {
-	select {
-	case errCh <- err:
-	default:
-	}
-}
-
 // resetPrefetchLocked останавливает текущий префетч и сбрасывает его поля. Требует удержания m.mu
 func (m *MultiReader) resetPrefetchLocked() {
 	if m.pfCancel != nil {
 		m.pfCancel()
 	}
-	oldDone := m.pfDone
-	if oldDone != nil { // Дождаться завершения старого префетчера, чтобы исключить параллельный доступ
-		<-oldDone
+	if m.pfDone != nil { // Дождаться завершения старого префетчера, чтобы исключить параллельный доступ
+		<-m.pfDone
 	}
 	m.pfStarted = false
 	m.pfBufCh = nil
 	m.pfErrCh = nil
 	m.pfDone = nil
 	m.pfCancel = nil
+}
+
+// sendErr отправляет ошибку в канал, если есть место
+func sendErr(errCh chan<- error, err error) {
+	select {
+	case errCh <- err:
+	default:
+	}
 }

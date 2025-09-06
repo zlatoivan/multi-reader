@@ -16,43 +16,32 @@ type SizedReadSeekCloser interface {
 }
 
 const (
-	// bufferSize - размер одного блока префетча.
-	bufferSize = 1024 * 1024
-	// defaultBuffersNum - количество блоков в окне буфера.
-	defaultBuffersNum = 4
+	bufferSize        = 1024 * 1024 // размер одного блока префетча
+	defaultBuffersNum = 4           // количество блоков в окне буфера
 )
 
-// MultiReader объединяет несколько SizedReadSeekCloser в единый конкатенированный поток
-// и поддерживает асинхронный префетч с ограниченным буфером через каналы.
-// Внешний Read отдаёт байты из внутреннего окна, которое наполняется фоном.
+// MultiReader объединяет несколько SizedReadSeekCloser в единый конкатенированный поток и поддерживает асинхронный префетч
 type MultiReader struct {
 	readers     []SizedReadSeekCloser // исходные ридеры
 	totalSize   int64                 // суммарный размер всех источников
 	prefixSizes []int64               // абсолютные стартовые позиции ридеров (префиксные суммы)
 	absPos      int64                 // абсолютная позиция курсора чтения (пользователя)
-
-	// Окно префетча
-	windowBuf   []byte // текущее окно данных
-	windowStart int64  // абсолютная позиция начала окна
-	buffersNum  int    // ёмкость окна (в блоках)
-
-	// Каналы и управление префетчем
-	pfBufCh   chan []byte        // буферизированный канал блоков, наполняется префетчером
-	pfErrCh   chan error         // канал для ошибки/EOF от префетчера (ёмкость 1)
-	pfCancel  context.CancelFunc // отмена контекста префетчера
-	pfDone    chan struct{}      // сигнал завершения горутины префетчера
-	pfStarted bool               // флаг запуска префетчера
-
-	// Состояние/синхронизация
-	mu     sync.Mutex
-	closed bool
+	windowBuf   []byte                // текущее окно данных
+	windowStart int64                 // абсолютная позиция начала окна
+	buffersNum  int                   // количество буферов
+	pfBufCh     chan []byte           // буферизированный канал блоков, наполняется префетчером
+	pfErrCh     chan error            // канал для ошибки/EOF от префетчера (ёмкость 1)
+	pfCancel    context.CancelFunc    // отмена контекста префетчера
+	pfDone      chan struct{}         // сигнал завершения горутины префетчера
+	pfStarted   bool                  // флаг запуска префетчера
+	mu          sync.Mutex            // мьютекс для блокировок
+	closed      bool                  // флаг закрытия мультиридера
 }
 
 // Проверка, что MultiReader удовлетворяет интерфейсу SizedReadSeekCloser
 var _ SizedReadSeekCloser = (*MultiReader)(nil)
 
-// NewMultiReader создаёт конкатенированный ридер поверх набора SizedReadSeekCloser
-// с поддержкой асинхронного префетча по каналам.
+// NewMultiReader создаёт конкатенированный ридер с поддержкой асинхронного префетча
 func NewMultiReader(buffersNum int, readers ...SizedReadSeekCloser) *MultiReader {
 	if buffersNum <= 0 {
 		buffersNum = defaultBuffersNum
@@ -70,17 +59,7 @@ func NewMultiReader(buffersNum int, readers ...SizedReadSeekCloser) *MultiReader
 		readers:     readers,
 		totalSize:   total,
 		prefixSizes: prefixSizes,
-		absPos:      0,
-		windowBuf:   nil,
-		windowStart: 0,
 		buffersNum:  buffersNum,
-		pfBufCh:     nil,
-		pfErrCh:     nil,
-		pfCancel:    nil,
-		pfDone:      nil,
-		pfStarted:   false,
-		mu:          sync.Mutex{},
-		closed:      false,
 	}
 }
 
@@ -134,8 +113,7 @@ func (m *MultiReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// Seek перемещает курсор. Если позиция внутри текущего окна - переиндексируем окно.
-// Иначе сбрасываем окно и перезапускаем префетч с новой позиции лениво.
+// Seek перемещает курсор
 func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -163,11 +141,9 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 
 	delta := seekPos - m.windowStart
 	switch {
-	// Быстрый путь: позиция внутри текущего окна - только сдвигаем смещение
-	case 0 <= delta && delta < int64(len(m.windowBuf)):
+	case 0 <= delta && delta < int64(len(m.windowBuf)): // Быстрый путь: позиция внутри текущего окна - только сдвигаем смещение
 		m.windowBuf = m.windowBuf[delta:]
-	// Вне окна: сбрасываем окно и перезапускаем префетч при следующем чтении
-	default:
+	default: // Вне окна: сбрасываем окно и перезапускаем префетч при следующем чтении
 		m.windowBuf = nil
 		if m.pfStarted {
 			m.resetPrefetchLocked()
@@ -316,7 +292,7 @@ func (m *MultiReader) readFromWindow(dst []byte) (int, bool) {
 		return 0, false
 	}
 
-	// Копируем и продвигаем курсоры, используя «срез с головы»
+	// Копируем и продвигаем курсоры
 	toCopy := min(len(dst), len(m.windowBuf))
 	copy(dst[:toCopy], m.windowBuf[:toCopy])
 	m.windowBuf = m.windowBuf[toCopy:]

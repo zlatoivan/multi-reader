@@ -47,7 +47,6 @@ type MultiReader struct {
 	// Состояние/синхронизация
 	mu     sync.Mutex
 	closed bool
-	stopCh chan struct{}
 }
 
 // Проверка, что MultiReader удовлетворяет интерфейсу SizedReadSeekCloser
@@ -84,7 +83,6 @@ func NewMultiReader(buffersNum int, readers ...SizedReadSeekCloser) *MultiReader
 		pfStarted:      false,
 		mu:             sync.Mutex{},
 		closed:         false,
-		stopCh:         make(chan struct{}),
 	}
 }
 
@@ -125,11 +123,6 @@ func (m *MultiReader) Read(p []byte) (n int, err error) {
 
 		// Окно пусто — ждём новые блоки или ошибку/закрытие
 		select {
-		case <-m.stopCh:
-			if n == 0 {
-				return 0, io.ErrClosedPipe
-			}
-			return n, io.ErrClosedPipe
 		case buf, ok := <-m.pfBufCh:
 			if !ok {
 				// Канал буферов закрыт — читаем ошибку/EOF
@@ -244,7 +237,6 @@ func (m *MultiReader) Close() error {
 		return nil
 	}
 	m.closed = true
-	close(m.stopCh)
 	if m.pfCancel != nil {
 		m.pfCancel()
 	}
@@ -371,23 +363,6 @@ func (m *MultiReader) prefetchLoop(ctx context.Context, startPos int64) {
 	}
 }
 
-// peekHead возвращает ссылку на текущий головной буфер или nil, если окно пусто.
-func (m *MultiReader) peekHead() []byte {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.window) == 0 {
-		return nil
-	}
-	return m.window[0]
-}
-
-// getConsumed возвращает количество отданных байтов в головном буфере.
-func (m *MultiReader) getConsumed() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.consumedInHead
-}
-
 // appendTail добавляет буфер в окно, обновляя начало окна при необходимости.
 func (m *MultiReader) appendTail(buf []byte) {
 	m.mu.Lock()
@@ -399,45 +374,6 @@ func (m *MultiReader) appendTail(buf []byte) {
 	}
 	m.window = append(m.window, buf)
 	m.mu.Unlock()
-}
-
-// copyFromHead копирует данные из головы окна в dst, обновляя позицию.
-func (m *MultiReader) copyFromHead(dst []byte) int {
-	m.mu.Lock()
-	if len(m.window) == 0 {
-		m.mu.Unlock()
-		return 0
-	}
-	head := m.window[0]
-	available := len(head) - m.consumedInHead
-	if available <= 0 {
-		m.headStart += int64(len(head))
-		m.window = m.window[1:]
-		m.consumedInHead = 0
-		m.mu.Unlock()
-		return 0
-	}
-	toCopy := len(dst)
-	if toCopy > available {
-		toCopy = available
-	}
-	copy(dst[:toCopy], head[m.consumedInHead:m.consumedInHead+toCopy])
-	m.consumedInHead += toCopy
-	m.absPos += int64(toCopy)
-	if m.consumedInHead == len(head) {
-		m.headStart += int64(len(head))
-		m.window = m.window[1:]
-		m.consumedInHead = 0
-	}
-	m.mu.Unlock()
-	return toCopy
-}
-
-// currentPosIsEOF сообщает, достигли ли общего EOF.
-func (m *MultiReader) currentPosIsEOF() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.absPos == m.totalSize
 }
 
 // readFromWindow копирует данные из окна в dst под локом. Возвращает (copied, true), если данные были.

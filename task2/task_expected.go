@@ -32,10 +32,9 @@ type MultiReader struct {
 	absPos      int64                 // абсолютная позиция курсора чтения (пользователя)
 
 	// Окно префетча
-	windowBuf        []byte // текущее окно данных
-	windowStart      int64  // абсолютная позиция начала окна
-	consumedInWindow int    // сколько байт уже отдано из окна
-	buffersNum       int    // ёмкость окна (в блоках)
+	windowBuf   []byte // текущее окно данных
+	windowStart int64  // абсолютная позиция начала окна
+	buffersNum  int    // ёмкость окна (в блоках)
 
 	// Каналы и управление префетчем
 	pfBufCh   chan []byte        // буферизированный канал блоков, наполняется префетчером
@@ -68,21 +67,20 @@ func NewMultiReader(buffersNum int, readers ...SizedReadSeekCloser) *MultiReader
 	prefixSizes[len(readers)] = total
 
 	return &MultiReader{
-		readers:          readers,
-		totalSize:        total,
-		prefixSizes:      prefixSizes,
-		absPos:           0,
-		windowBuf:        nil,
-		windowStart:      0,
-		consumedInWindow: 0,
-		buffersNum:       buffersNum,
-		pfBufCh:          nil,
-		pfErrCh:          nil,
-		pfCancel:         nil,
-		pfDone:           nil,
-		pfStarted:        false,
-		mu:               sync.Mutex{},
-		closed:           false,
+		readers:     readers,
+		totalSize:   total,
+		prefixSizes: prefixSizes,
+		absPos:      0,
+		windowBuf:   nil,
+		windowStart: 0,
+		buffersNum:  buffersNum,
+		pfBufCh:     nil,
+		pfErrCh:     nil,
+		pfCancel:    nil,
+		pfDone:      nil,
+		pfStarted:   false,
+		mu:          sync.Mutex{},
+		closed:      false,
 	}
 }
 
@@ -163,22 +161,21 @@ func (m *MultiReader) Seek(offset int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("seek position (%d) should be >= 0 and <= totalSize (%d)", seekPos, m.totalSize)
 	}
 
-	// Быстрый путь: позиция внутри текущего окна - только сдвигаем смещение
 	delta := seekPos - m.windowStart
-	if 0 <= delta && delta < int64(len(m.windowBuf)) {
-		m.consumedInWindow = int(delta)
-		m.absPos = seekPos
-		return seekPos, nil
+	switch {
+	// Быстрый путь: позиция внутри текущего окна - только сдвигаем смещение
+	case 0 <= delta && delta < int64(len(m.windowBuf)):
+		m.windowBuf = m.windowBuf[delta:]
+	// Вне окна: сбрасываем окно и перезапускаем префетч при следующем чтении
+	default:
+		m.windowBuf = nil
+		if m.pfStarted {
+			m.resetPrefetchLocked()
+		}
 	}
 
-	// Вне окна: сбрасываем окно и перезапускаем префетч при следующем чтении
-	m.windowBuf = nil
-	m.consumedInWindow = 0
 	m.windowStart = seekPos
 	m.absPos = seekPos
-	if m.pfStarted {
-		m.resetPrefetchLocked()
-	}
 
 	return seekPos, nil
 }
@@ -280,7 +277,7 @@ func (m *MultiReader) prefetchLoop(ctx context.Context, startPos int64) {
 			needSeek = true
 		}
 		remainInReader := int(m.prefixSizes[curReaderIdx+1] - curPos)
-		if remainInReader == 0 { // Достигли границы
+		if remainInReader == 0 { // Достигли границы ридеров
 			nextReader()
 			continue
 		}
@@ -316,19 +313,12 @@ func (m *MultiReader) readFromWindow(dst []byte) (int, bool) {
 		return 0, false
 	}
 
-	// Копируем и продвигаем курсоры
-	available := len(m.windowBuf) - m.consumedInWindow
-	toCopy := min(len(dst), available)
-	copy(dst[:toCopy], m.windowBuf[m.consumedInWindow:m.consumedInWindow+toCopy])
-	m.consumedInWindow += toCopy
+	// Копируем и продвигаем курсоры, используя «срез с головы»
+	toCopy := min(len(dst), len(m.windowBuf))
+	copy(dst[:toCopy], m.windowBuf[:toCopy])
+	m.windowBuf = m.windowBuf[toCopy:]
+	m.windowStart += int64(toCopy)
 	m.absPos += int64(toCopy)
-
-	// Если съели окно целиком - сдвигаем начало и очищаем окно
-	if m.consumedInWindow == len(m.windowBuf) {
-		m.windowStart += int64(len(m.windowBuf))
-		m.windowBuf = nil
-		m.consumedInWindow = 0
-	}
 
 	return toCopy, true
 }

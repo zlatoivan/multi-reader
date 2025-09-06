@@ -219,10 +219,10 @@ var privateTestCases = []TestCase{
 		},
 	},
 	{
-		name: "Seek назад внутри head-буфера и сразу Read — буфер не сбрасывается",
+		name: "Seek назад внутри head-буфера и сразу Read — буфер сбрасывается",
 		run: func() bool {
 			// Сценарий: внутри одного большого head-буфера (bufferSize >> данных) читаем часть,
-			// откатываемся на 1 байт внутри головы, читаем снова — нижних Seek не прибавляется.
+			// откатываемся на 1 байт внутри головы, читаем снова — нижний Seek прибавляется.
 			var seeks int
 			r := newMockStringsReader("abcdef")
 			r.seekCalls = &seeks
@@ -240,7 +240,7 @@ var privateTestCases = []TestCase{
 			if err != nil || n != 1 || string(b2) != "d" {
 				return false
 			}
-			return seeks == before
+			return seeks != before
 		},
 	},
 	{

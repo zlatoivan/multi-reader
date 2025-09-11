@@ -1,4 +1,4 @@
-module github.com/zlatoivan/multi-reader
+module github.com/zlatoivan/go-advanced
 
 go 1.23.5
 

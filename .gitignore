@@ -1,4 +1,3 @@
 .idea
-/task1/__tests
-/task2/__tests
 /multi-reader/docs/
+/buf-reader-writer/docs/

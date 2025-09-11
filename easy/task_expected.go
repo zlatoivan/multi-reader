@@ -54,12 +54,12 @@ func (m *MultiReader) Read(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	if m.absPos == m.totalSize {
+		return 0, io.EOF
+	}
 
 	for n < len(p) {
-		switch {
-		case m.absPos == m.totalSize && n == 0: // Еще ничего не прочитали, а уже дошли до конца
-			return 0, io.EOF
-		case m.absPos == m.totalSize: // Уже что-то прочитали в этом вызове (n > 0), а затем дошли до конца
+		if m.absPos == m.totalSize { // Уже что-то прочитали в этом вызове (n > 0), а затем дошли до конца
 			return n, nil
 		}
 
